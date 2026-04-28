@@ -1,0 +1,271 @@
+================================================================================
+  URL SHORTENER — ARCHITECTURE SUMMARY
+================================================================================
+
+OVERVIEW
+--------
+A production-grade URL shortener written in Go. Every feature is chosen to
+mirror real distributed-systems design decisions (Alex Xu, System Design
+Interview Vol. 1 & 2):
+
+  • Base-62 short codes  →  Chapter 8  (Design a URL Shortener)
+  • Consistent hashing   →  Chapter 5  (Design Consistent Hashing)
+  • Rate limiting        →  Chapter 4  (Design a Rate Limiter)
+  • Redis caching        →  Chapter 6  (Design a Key-Value Store)
+
+The remaining pieces (analytics, GeoIP, link expiry) extend the core design
+with real-world operational requirements.
+
+================================================================================
+  REQUEST FLOW  (happy path — cached redirect)
+================================================================================
+
+  Browser
+    │
+    │  GET /Xk9mQr
+    ▼
+  Gin Router  ──►  GET /:code  handler (no rate-limit on the hot path)
+    │
+    │  1. Redis GET "url:Xk9mQr"   ─── HIT ──►  return cached *Link  ◄─┐
+    │                                                                     │
+    │  1. Redis GET "url:Xk9mQr"   ─── MISS ──►  Consistent-Hash ring   │
+    │                                              │                      │
+    │                                              ▼                      │
+    │                                         PostgreSQL shard N          │
+    │                                              │                      │
+    │                                              ▼                      │
+    │                                         Redis SET (re-warm) ────────┘
+    │
+    │  2. Check ExpiresAt  →  410 Gone if expired
+    │
+    │  3. analytics.Recorder.Record(click)  — non-blocking channel write
+    │     └─ background goroutine batches → INSERT INTO clicks (shard N)
+    │
+    │  4. 302 → LongURL
+
+================================================================================
+  COMPONENT DEFINITIONS
+================================================================================
+
+1. BASE-62 ENCODING  (internal/shortcode/base62.go)
+   --------------------------------------------------
+   Alphabet : 0–9  A–Z  a–z  (62 characters)
+   Code length : 6 characters
+   Keyspace : 62^6 = 56,800,235,584 ≈ 56 billion unique codes
+
+   Why Base-62?
+   - URL-safe (no +, /, = like Base-64).
+   - All printable ASCII — no encoding needed in browsers.
+   - 6 chars fits in a single CPU cache line.
+   - Cryptographically random selection via crypto/rand prevents enumeration.
+
+   Custom aliases are validated separately: 4–32 chars from [0-9 A-Z a-z _ -].
+
+2. CONSISTENT HASHING  (internal/repository/shard.go)
+   ----------------------------------------------------
+   Library : github.com/zeayush/consistent-hashing-go
+   Ring     : 150 virtual nodes per physical shard (weight = 1)
+   Hash fn  : CRC-32 (hardware-accelerated on x86/ARM)
+   Lookup   : O(log n) binary search on a sorted []uint32 slice
+
+   What problem does it solve?
+   With naive modular hashing (shard = hash(code) % N), adding or removing
+   one database node remaps ~N-1/N of all keys, causing a thundering-herd
+   cache miss storm. Consistent hashing limits remapping to ~1/N of keys.
+
+   How it works in this project:
+   - Shard names "shard-0", "shard-1", … are added to the ring.
+   - Every short code lookup calls ring.Get(code) → shard name → *sql.DB.
+   - The same route is used for INSERT, SELECT, DELETE, and analytics reads,
+     so a link always lives on exactly one shard.
+
+   ShardRouter.GetDB(key) is the single entry point for all DB routing.
+
+3. REDIS CACHING  (internal/cache/redis.go)
+   ------------------------------------------
+   Key scheme : "url:{shortCode}"
+   TTL        : min(link.ExpiresAt – now, 1 hour)   or 1 hour (no expiry)
+   Serialisation : JSON
+
+   Why Redis and not in-process?
+   - Shared across all app replicas (horizontal scaling).
+   - Survives app restarts.
+   - Redis GET is sub-1 ms on localhost; P99 ~0.3 ms in the same datacenter.
+
+   Cache operations:
+   - GetLink      → deserialise JSON from Redis
+   - SetLink      → serialise to JSON, SET with TTL
+   - DeleteLink   → DEL key on link deletion
+   - IncrClickCount → read-modify-write on cache hit (approx click counter)
+   - Ping         → health check
+
+4. CLICK ANALYTICS  (internal/analytics/recorder.go)
+   ---------------------------------------------------
+   Architecture: producer/consumer with a buffered channel.
+
+   Producer (redirect handler, goroutine-safe):
+     recorder.Record(click) — writes to chan model.Click, non-blocking.
+     If the buffer is full, the event is dropped ("at most once" semantics).
+     The redirect path never waits for a DB write.
+
+   Consumer (single background goroutine):
+     Drains the channel every 2 seconds OR when a batch of 64 events
+     accumulates, whichever comes first.
+     Batches are grouped by *sql.DB (consistent-hash routing) and flushed
+     with a single multi-row INSERT per shard, then click_count is
+     incremented via UPDATE.
+
+   Privacy: client IPs are stored as SHA-256 hashes only (hex string).
+            Raw IPs are never persisted.
+
+   Fields recorded per click:
+     short_code, clicked_at, ip_hash, country (ISO 3166-1), device_type,
+     referrer
+
+   Device detection: UA string pattern matching →
+     bot | tablet | mobile | desktop | unknown
+
+   Country detection: MaxMind GeoLite2-Country mmdb
+     (degrades gracefully to "" if the .mmdb file is absent)
+
+5. LINK EXPIRY  (model, repository, handler)
+   -------------------------------------------
+   TTL is stored as an OPTIONAL timestamptz column (expires_at).
+   At redirect time the handler checks time.Now().After(*link.ExpiresAt)
+   and returns 410 Gone for expired links.
+   The Redis cache TTL is also capped to min(remaining_ttl, 1 hour) so
+   expired links are never served from cache after their deadline.
+   A partial-index on expires_at (WHERE expires_at IS NOT NULL) keeps the
+   table scan fast for a future background expiry-cleanup job.
+
+6. RATE LIMITING  (internal/ratelimit/)
+   --------------------------------------
+   Algorithm  : Token Bucket
+   Backend    : Redis (primary) → in-memory MemoryStore (fallback)
+   Key        : client IP address (GinIPExtractor)
+   Scope      : /api/* routes only — the redirect hot path is NOT limited.
+
+   Token Bucket recap:
+     Bucket capacity = Burst tokens.
+     Tokens refill at Rate tokens per Window.
+     Each request consumes 1 token.
+     Empty bucket → 429 Too Many Requests + Retry-After header.
+
+   Lazy refill: tokens are calculated on demand from
+     new_tokens = min(burst, tokens + elapsed_seconds × rate)
+   No background goroutine needed; zero overhead between requests.
+
+   Redis Lua script (atomic):
+     HMGET key tokens last_ns
+     refill → if tokens ≥ 1: HMSET, PEXPIRE, return {1, remaining, 0}
+              else:           return {0, 0, retry_after_ns}
+   The single script execution eliminates the INCR/EXPIRE race condition
+   present in naive Redis rate limiters.
+
+   Fail-open policy: if Redis returns an error the request falls through
+   to the in-memory MemoryStore so a Redis outage never blocks traffic.
+
+   Response headers:
+     X-RateLimit-Limit     — max requests in window
+     X-RateLimit-Remaining — tokens left
+     X-RateLimit-Reset     — Unix timestamp of next refill
+     Retry-After           — seconds until retry (429 only)
+
+7. REST API  (internal/handler/)
+   --------------------------------
+   POST   /api/links                — create a shortened URL
+   GET    /api/links/:code          — fetch link metadata
+   DELETE /api/links/:code          — delete a link (evicts cache)
+   GET    /api/links/:code/analytics — aggregated click stats
+   GET    /:code                    — redirect (hot path, no rate limit)
+   GET    /health                   — Redis connectivity check
+
+8. POSTGRESQL SCHEMA  (migrations/001_init.sql)
+   -----------------------------------------------
+   Table: links
+     id             BIGSERIAL PK
+     short_code     VARCHAR(32) UNIQUE NOT NULL
+     long_url       TEXT NOT NULL
+     is_custom_alias BOOLEAN DEFAULT FALSE
+     created_at     TIMESTAMPTZ DEFAULT NOW()
+     expires_at     TIMESTAMPTZ (nullable)
+     click_count    BIGINT DEFAULT 0
+
+   Table: clicks
+     id             BIGSERIAL PK
+     short_code     FK → links(short_code) ON DELETE CASCADE
+     clicked_at     TIMESTAMPTZ DEFAULT NOW()
+     ip_hash        VARCHAR(64)  — SHA-256 of client IP
+     country        VARCHAR(3)   — ISO 3166-1
+     device_type    VARCHAR(16)
+     referrer       TEXT
+
+   Indexes:
+     idx_links_short_code        — fast redirect lookup
+     idx_links_expires_at        — partial index (WHERE expires_at IS NOT NULL)
+     idx_clicks_short_code       — analytics queries
+     idx_clicks_clicked_at       — time-range analytics (DESC)
+
+9. GEOIP  (internal/geoip/geoip.go)
+   ------------------------------------
+   Library : github.com/oschwald/maxminddb-golang
+   Database: MaxMind GeoLite2-Country.mmdb (free, ~6 MB)
+
+   Resolver.Country(ip) → ISO 3166-1 alpha-2 code (e.g. "US", "IN", "GB")
+   Returns "" for private IPs, parse errors, or missing database.
+   The application starts successfully even without the .mmdb file —
+   the no-op resolver logs a warning and disables country tracking.
+
+10. CONFIGURATION  (internal/config/config.go)
+    ---------------------------------------------
+    All config is sourced from environment variables (12-factor app).
+    DB shards are discovered by scanning DB_SHARD_0_DSN, DB_SHARD_1_DSN, …
+    in order; adding a shard requires only a new env var + rebalance.
+
+================================================================================
+  PACKAGE TREE
+================================================================================
+
+  cmd/server/main.go                — entrypoint, wires everything together
+  internal/
+    config/config.go                — env-var config loader
+    model/model.go                  — domain structs + request/response DTOs
+    shortcode/base62.go             — Base-62 code generation & validation
+    cache/redis.go                  — Redis link cache
+    geoip/geoip.go                  — MaxMind country resolver
+    analytics/recorder.go           — async click event pipeline
+    repository/
+      postgres.go                   — SQL data-access (single shard)
+      shard.go                      — consistent-hash shard router
+    ratelimit/
+      limiter.go                    — interfaces + Config / Result types
+      tokenbucket.go                — single-key token-bucket algorithm
+      store/
+        memory.go                   — in-memory KeyedLimiter (fallback)
+        redis.go                    — Redis KeyedLimiter (Lua-atomic)
+      middleware/
+        gin.go                      — Gin rate-limit middleware
+    handler/
+      router.go                     — route registration
+      links.go                      — create / get / delete handlers
+      redirect.go                   — redirect hot-path handler
+      analytics.go                  — analytics endpoint handler
+  migrations/001_init.sql           — idempotent schema (all shards)
+  Dockerfile                        — multi-stage: builder → alpine runtime
+  docker-compose.yml                — app + 2× postgres + redis
+  .env.example                      — all supported env vars with defaults
+
+================================================================================
+  TECH STACK
+================================================================================
+
+  Language  : Go 1.22
+  Framework : Gin (HTTP routing + middleware)
+  Database  : PostgreSQL 16  (2 shards via Docker Compose)
+  Cache     : Redis 7
+  GeoIP     : MaxMind GeoLite2-Country
+  Infra     : Docker Compose (local), any container platform (prod)
+  Hashing   : github.com/zeayush/consistent-hashing-go (CRC-32 ring)
+  Limiting  : in-tree port of github.com/zeayush/rate-limiter-go (token bucket)
+
+================================================================================

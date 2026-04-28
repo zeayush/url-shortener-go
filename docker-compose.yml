@@ -1,0 +1,86 @@
+services:
+  # ── Application ─────────────────────────────────────────────────────────────
+  app:
+    build: .
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    environment:
+      BASE_URL:               "http://localhost:${APP_PORT:-8080}"
+      SERVER_ADDR:            ":8080"
+      DB_SHARD_0_DSN:         "postgres://urlshortener:secret@postgres-0:5432/urlshortener?sslmode=disable"
+      DB_SHARD_1_DSN:         "postgres://urlshortener:secret@postgres-1:5432/urlshortener?sslmode=disable"
+      REDIS_ADDR:             "redis:6379"
+      REDIS_PASSWORD:         ""
+      GEOIP_DB_PATH:          "/app/data/GeoLite2-Country.mmdb"
+      RATE_LIMIT:             "100"
+      RATE_BURST:             "20"
+      RATE_WINDOW_SECONDS:    "60"
+      ANALYTICS_BUFFER_SIZE:  "2048"
+    volumes:
+      - ./data:/app/data:ro   # mount GeoIP DB if present
+    depends_on:
+      postgres-0:
+        condition: service_healthy
+      postgres-1:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PostgreSQL shard 0 ───────────────────────────────────────────────────────
+  postgres-0:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     urlshortener
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB:       urlshortener
+    ports:
+      - "${PG0_PORT:-5432}:5432"
+    volumes:
+      - pg0_data:/var/lib/postgresql/data
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── PostgreSQL shard 1 ───────────────────────────────────────────────────────
+  postgres-1:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     urlshortener
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB:       urlshortener
+    ports:
+      - "${PG1_PORT:-5433}:5432"
+    volumes:
+      - pg1_data:/var/lib/postgresql/data
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U urlshortener"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Redis ────────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pg0_data:
+  pg1_data:
+  redis_data:
