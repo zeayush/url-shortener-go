@@ -1,5 +1,5 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM golang:1.22-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 RUN apk add --no-cache git ca-certificates
 
@@ -20,14 +20,15 @@ RUN apk add --no-cache ca-certificates tzdata
 
 # Non-root user
 RUN addgroup -S app && adduser -S app -G app
-USER app
 
 WORKDIR /app
 
+# Create data dir as root before dropping privileges
+RUN mkdir -p /app/data && chown -R app:app /app
+
 COPY --from=builder /bin/server /app/server
 
-# Optional: GeoLite2 database (mount at runtime or bake in)
-RUN mkdir -p /app/data
+USER app
 
 EXPOSE 8080
 
