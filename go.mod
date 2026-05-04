@@ -8,6 +8,7 @@ require (
 	github.com/oschwald/maxminddb-golang v1.13.1
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/zeayush/consistent-hashing-go v0.0.0-20260404120428-a44011969a4f
+	github.com/zeayush/rate-limiter-go v0.0.0-20260504124514-0e453646e212
 )
 
 require (

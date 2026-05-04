@@ -80,6 +80,8 @@ github.com/ugorji/go/codec v1.3.1 h1:waO7eEiFDwidsBN6agj1vJQ4AG7lh2yqXyOXqhgQuyY
 github.com/ugorji/go/codec v1.3.1/go.mod h1:pRBVtBSKl77K30Bv8R2P+cLSGaTtex6fsA2Wjqmfxj4=
 github.com/zeayush/consistent-hashing-go v0.0.0-20260404120428-a44011969a4f h1:/DZFoaz6VFez8xFrVZccPW7ucRnp16oIFMidFI7sZFo=
 github.com/zeayush/consistent-hashing-go v0.0.0-20260404120428-a44011969a4f/go.mod h1:3XkgLfbYlf1P/jIquNJkmrXQgZUYTC1T65nxjAm5iQ8=
+github.com/zeayush/rate-limiter-go v0.0.0-20260504124514-0e453646e212 h1:+54ZQZMIgADWDtw02nCY7YHmeIMnlpOz+vfWKQEisXM=
+github.com/zeayush/rate-limiter-go v0.0.0-20260504124514-0e453646e212/go.mod h1:AV1/TkfVR6kgLCzLHwppHwcNlOAhqtJoNVZ0+UF3Tl4=
 github.com/zeebo/xxh3 v1.1.0 h1:s7DLGDK45Dyfg7++yxI0khrfwq9661w9EN78eP/UZVs=
 github.com/zeebo/xxh3 v1.1.0/go.mod h1:IisAie1LELR4xhVinxWS5+zf1lA4p0MW4T+w+W07F5s=
 go.mongodb.org/mongo-driver/v2 v2.5.0 h1:yXUhImUjjAInNcpTcAlPHiT7bIXhshCTL3jVBkF3xaE=

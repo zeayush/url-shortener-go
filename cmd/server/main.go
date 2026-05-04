@@ -12,14 +12,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
+	"github.com/zeayush/rate-limiter-go/limiter"
+	rlstore "github.com/zeayush/rate-limiter-go/store"
 	"github.com/zeayush/url-shortener-go/internal/analytics"
 	"github.com/zeayush/url-shortener-go/internal/cache"
 	"github.com/zeayush/url-shortener-go/internal/config"
 	"github.com/zeayush/url-shortener-go/internal/geoip"
 	"github.com/zeayush/url-shortener-go/internal/handler"
-	"github.com/zeayush/url-shortener-go/internal/ratelimit"
-	rlstore "github.com/zeayush/url-shortener-go/internal/ratelimit/store"
-	"github.com/zeayush/url-shortener-go/internal/ratelimit/middleware"
 	"github.com/zeayush/url-shortener-go/internal/repository"
 )
 
@@ -68,18 +67,13 @@ func main() {
 	go recorder.Run(recCtx)
 
 	// ── Rate limiter (Token Bucket, Redis-backed, IP-keyed) ──────────────────
-	//
-	// Mirrors the zeayush/rate-limiter-go Month 2 Week 1 setup:
-	//   store.NewMemoryStore → fallback
-	//   store.NewRedisStore  → primary (Lua-atomic token bucket)
-	//   middleware.GinMiddleware + GinIPExtractor
-	rlCfg := ratelimit.Config{
+	rlCfg := limiter.Config{
 		Rate:   cfg.RateLimit,
 		Window: cfg.RateWindow,
 		Burst:  cfg.RateBurst,
 	}
-	memStore, err := rlstore.NewMemoryStore(func(_ string) (ratelimit.Limiter, error) {
-		return ratelimit.NewTokenBucket(rlCfg)
+	memStore, err := rlstore.NewMemoryStore(func(_ string) (limiter.Limiter, error) {
+		return limiter.NewTokenBucket(rlCfg)
 	})
 	if err != nil {
 		slog.Error("memory store init failed", "err", err)
@@ -90,8 +84,6 @@ func main() {
 		slog.Error("redis store init failed", "err", err)
 		os.Exit(1)
 	}
-
-	_ = middleware.GinIPExtractor // ensure the package is used (router.go references it)
 
 	// ── Gin router ───────────────────────────────────────────────────────────
 	gin.SetMode(gin.ReleaseMode)

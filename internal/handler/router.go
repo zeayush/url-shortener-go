@@ -3,12 +3,12 @@ package handler
 
 import (
 	"github.com/gin-gonic/gin"
+	"github.com/zeayush/rate-limiter-go/limiter"
+	rlmw "github.com/zeayush/rate-limiter-go/middleware"
 	"github.com/zeayush/url-shortener-go/internal/analytics"
 	"github.com/zeayush/url-shortener-go/internal/cache"
 	"github.com/zeayush/url-shortener-go/internal/config"
 	"github.com/zeayush/url-shortener-go/internal/geoip"
-	rlmw "github.com/zeayush/url-shortener-go/internal/ratelimit/middleware"
-	"github.com/zeayush/url-shortener-go/internal/ratelimit"
 	"github.com/zeayush/url-shortener-go/internal/repository"
 )
 
@@ -39,7 +39,7 @@ func New(
 }
 
 // Register attaches all routes to r.
-func (h *Handler) Register(r *gin.Engine, rl ratelimit.KeyedLimiter) {
+func (h *Handler) Register(r *gin.Engine, rl limiter.KeyedLimiter) {
 	// ── Redirect (hot path — no rate limit, sub-1 ms via Redis cache) ───────
 	r.GET("/:code", h.Redirect)
 
