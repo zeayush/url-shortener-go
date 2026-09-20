@@ -24,19 +24,30 @@ const (
 // ErrNotFound is returned when a key is absent in Redis.
 var ErrNotFound = errors.New("cache: key not found")
 
+// ErrDisabled is returned by Ping when no Redis client is configured.
+var ErrDisabled = errors.New("cache: disabled (no Redis configured)")
+
 // Cache is a Redis-backed read-through / write-through cache for Link records.
 type Cache struct {
 	rdb *redis.Client
 }
 
-// New creates a Cache backed by the supplied Redis client.
+// New creates a Cache backed by the supplied Redis client. A nil client is
+// valid and means "no cache": every read misses, every write is dropped, and
+// nothing is dialed. Callers therefore need no separate cache-enabled check.
 func New(rdb *redis.Client) *Cache {
 	return &Cache{rdb: rdb}
 }
 
+// Enabled reports whether a Redis client is attached.
+func (c *Cache) Enabled() bool { return c != nil && c.rdb != nil }
+
 // GetLink fetches the link for shortCode from Redis.
 // Returns ErrNotFound on a cache miss.
 func (c *Cache) GetLink(ctx context.Context, shortCode string) (*model.Link, error) {
+	if !c.Enabled() {
+		return nil, ErrNotFound
+	}
 	val, err := c.rdb.Get(ctx, keyPrefix+shortCode).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, ErrNotFound
@@ -54,6 +65,9 @@ func (c *Cache) GetLink(ctx context.Context, shortCode string) (*model.Link, err
 
 // SetLink stores link in Redis and sets an appropriate TTL.
 func (c *Cache) SetLink(ctx context.Context, link *model.Link) error {
+	if !c.Enabled() {
+		return nil
+	}
 	ttl := defaultTTL
 	if link.ExpiresAt != nil {
 		remaining := time.Until(*link.ExpiresAt)
@@ -79,6 +93,9 @@ func (c *Cache) SetLink(ctx context.Context, link *model.Link) error {
 
 // DeleteLink evicts shortCode from Redis.
 func (c *Cache) DeleteLink(ctx context.Context, shortCode string) error {
+	if !c.Enabled() {
+		return nil
+	}
 	if err := c.rdb.Del(ctx, keyPrefix+shortCode).Err(); err != nil {
 		return fmt.Errorf("cache: delete %q: %w", shortCode, err)
 	}
@@ -96,7 +113,11 @@ func (c *Cache) IncrClickCount(ctx context.Context, shortCode string) {
 	_ = c.SetLink(ctx, link)
 }
 
-// Ping checks that Redis is reachable.
+// Ping checks that Redis is reachable. ErrDisabled distinguishes "switched
+// off deliberately" from "configured but broken" for the health endpoint.
 func (c *Cache) Ping(ctx context.Context) error {
+	if !c.Enabled() {
+		return ErrDisabled
+	}
 	return c.rdb.Ping(ctx).Err()
 }

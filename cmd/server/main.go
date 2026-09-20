@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,15 +39,26 @@ func main() {
 	}
 	defer shard.Close()
 
-	// ── Redis ────────────────────────────────────────────────────────────────
-	rdb := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPassword,
-	})
+	// ── Redis (optional) ─────────────────────────────────────────────────────
+	// When REDIS_ADDR is unset-to-empty the client is never built. That is the
+	// difference between running without a cache and running against a dead
+	// one: a dead endpoint is dialed and retried on every request, which costs
+	// seconds per call before the in-memory fallback takes over.
 	ctx := context.Background()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		slog.Warn("redis unreachable at startup — cache and distributed rate limiting disabled",
-			"addr", cfg.RedisAddr, "err", err)
+	var rdb *redis.Client
+	if cfg.RedisEnabled() {
+		opts, err := redisOptions(cfg)
+		if err != nil {
+			slog.Error("redis config invalid", "err", err)
+			os.Exit(1)
+		}
+		rdb = redis.NewClient(opts)
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			slog.Warn("redis unreachable at startup — cache and distributed rate limiting disabled",
+				"addr", cfg.RedisAddr, "err", err)
+		}
+	} else {
+		slog.Info("redis not configured — cache disabled, rate limiting in-process")
 	}
 
 	// ── Cache ────────────────────────────────────────────────────────────────
@@ -79,10 +91,16 @@ func main() {
 		slog.Error("memory store init failed", "err", err)
 		os.Exit(1)
 	}
-	redisStore, err := rlstore.NewRedisStore(rdb, rlCfg, memStore)
-	if err != nil {
-		slog.Error("redis store init failed", "err", err)
-		os.Exit(1)
+	// Without Redis the memory store is the limiter outright, rather than the
+	// fallback behind a Redis store that fails on every call first.
+	var rateLimiter limiter.KeyedLimiter = memStore
+	if cfg.RedisEnabled() {
+		redisStore, err := rlstore.NewRedisStore(rdb, rlCfg, memStore)
+		if err != nil {
+			slog.Error("redis store init failed", "err", err)
+			os.Exit(1)
+		}
+		rateLimiter = redisStore
 	}
 
 	// ── Gin router ───────────────────────────────────────────────────────────
@@ -92,7 +110,7 @@ func main() {
 	r.Use(requestLogger())
 
 	h := handler.New(cfg, shard, cacheLayer, recorder, geo)
-	h.Register(r, redisStore)
+	h.Register(r, rateLimiter)
 
 	// ── HTTP server with graceful shutdown ───────────────────────────────────
 	srv := &http.Server{
@@ -124,6 +142,36 @@ func main() {
 		slog.Error("graceful shutdown failed", "err", err)
 	}
 	slog.Info("shutdown complete")
+}
+
+// redisOptions builds the client config from either REDIS_URL (preferred — it
+// carries the scheme, so "rediss://" turns on TLS) or the host/password pair.
+//
+// Timeouts are deliberately tight and retries are off: the cache and the rate
+// limiter both have a correct in-process fallback, so a slow Redis is worse
+// than an absent one. The library defaults (3 retries with backoff) turn a
+// Redis outage into seconds of added latency on every single request.
+func redisOptions(cfg *config.Config) (*redis.Options, error) {
+	var opts *redis.Options
+
+	if cfg.RedisURL != "" {
+		parsed, err := redis.ParseURL(cfg.RedisURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse REDIS_URL: %w", err)
+		}
+		opts = parsed
+	} else {
+		opts = &redis.Options{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPassword,
+		}
+	}
+
+	opts.DialTimeout = 500 * time.Millisecond
+	opts.ReadTimeout = 300 * time.Millisecond
+	opts.WriteTimeout = 300 * time.Millisecond
+	opts.MaxRetries = -1 // -1 disables retries; 0 would mean "use the default"
+	return opts, nil
 }
 
 // requestLogger returns a minimal structured-logging middleware.

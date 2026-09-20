@@ -18,6 +18,11 @@ type Config struct {
 	// the slice index, so DSN order must remain stable across deploys.
 	DBShards []string
 
+	// RedisURL, when set, fully describes the connection (scheme, credentials,
+	// TLS) and takes precedence over RedisAddr/RedisPassword. Hosted Redis
+	// providers hand out exactly this string, and a "rediss://" scheme is the
+	// only way TLS gets enabled.
+	RedisURL      string
 	RedisAddr     string
 	RedisPassword string
 
@@ -37,7 +42,8 @@ func Load() (*Config, error) {
 	c := &Config{
 		BaseURL:             getEnv("BASE_URL", "http://localhost:8080"),
 		ServerAddr:          getEnv("SERVER_ADDR", ":8080"),
-		RedisAddr:           getEnv("REDIS_ADDR", "localhost:6379"),
+		RedisURL:            strings.TrimSpace(os.Getenv("REDIS_URL")),
+		RedisAddr:           redisAddr(),
 		RedisPassword:       getEnv("REDIS_PASSWORD", ""),
 		GeoIPDBPath:         getEnv("GEOIP_DB_PATH", "./data/GeoLite2-Country.mmdb"),
 		AnalyticsBufferSize: 2048,
@@ -82,6 +88,27 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
+// redisAddr resolves the Redis endpoint, distinguishing "not configured" from
+// "configured but down".
+//
+// Setting REDIS_ADDR to an empty string (or off/none/disabled) turns Redis off
+// outright: main never constructs a client, so no request pays a dial timeout
+// on its way to the in-memory fallback. Leaving the variable unset keeps the
+// local-development default. This matters on a free-tier deployment with no
+// Redis alongside it — an unreachable endpoint costs seconds per request,
+// while an unconfigured one costs nothing.
+func redisAddr() string {
+	v, ok := os.LookupEnv("REDIS_ADDR")
+	if !ok {
+		return "localhost:6379"
+	}
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "", "off", "none", "disabled":
+		return ""
+	}
+	return v
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -100,3 +127,7 @@ func parseInt64Env(key string, fallback int64) (int64, error) {
 	}
 	return n, nil
 }
+
+// RedisEnabled reports whether a Redis endpoint is configured. When false the
+// cache degrades to always-miss and rate limiting stays in-process.
+func (c *Config) RedisEnabled() bool { return c.RedisURL != "" || c.RedisAddr != "" }

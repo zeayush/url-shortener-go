@@ -8,6 +8,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/url"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq" // PostgreSQL driver
@@ -17,22 +20,89 @@ import (
 // ErrNotFound is returned when a short code is not present on the queried shard.
 var ErrNotFound = errors.New("repository: link not found")
 
-// Open opens a PostgreSQL connection pool for dsn and verifies connectivity.
+// Connection-verification budget. A serverless PostgreSQL (Neon, and the like)
+// suspends its compute after a few minutes idle; the connection that wakes it
+// can take several seconds to be accepted. A single short ping would fail
+// there, and since NewShardRouter surfaces that to main as a fatal error, the
+// process would exit on the first request after an idle period. Retrying
+// inside the budget lets a cold database wake on its own.
+const (
+	pingBudget         = 30 * time.Second
+	pingAttemptTimeout = 5 * time.Second
+	pingBackoffInitial = 250 * time.Millisecond
+	pingBackoffMax     = 4 * time.Second
+)
+
+// Open opens a PostgreSQL connection pool for dsn and verifies connectivity,
+// retrying while the database wakes. Errors carry a redacted DSN: the raw one
+// holds the password, and these lines reach the platform log.
 func Open(dsn string) (*sql.DB, error) {
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("repository: open %q: %w", dsn, err)
+		return nil, fmt.Errorf("repository: open %s: %w", redactDSN(dsn), err)
 	}
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := db.PingContext(ctx); err != nil {
-		return nil, fmt.Errorf("repository: ping %q: %w", dsn, err)
+	if err := pingWithRetry(db, redactDSN(dsn)); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
 	return db, nil
+}
+
+// pingWithRetry pings db until it answers or pingBudget is spent, backing off
+// exponentially between attempts. safeDSN is already redacted.
+func pingWithRetry(db *sql.DB, safeDSN string) error {
+	deadline := time.Now().Add(pingBudget)
+	backoff := pingBackoffInitial
+
+	for attempt := 1; ; attempt++ {
+		ctx, cancel := context.WithTimeout(context.Background(), pingAttemptTimeout)
+		err := db.PingContext(ctx)
+		cancel()
+
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("database reachable after retry",
+					"dsn", safeDSN, "attempts", attempt)
+			}
+			return nil
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return fmt.Errorf("repository: ping %s: unreachable after %d attempts in %s: %w",
+				safeDSN, attempt, pingBudget, err)
+		}
+
+		slog.Warn("database not ready, retrying",
+			"dsn", safeDSN, "attempt", attempt, "retry_in", backoff, "err", err)
+
+		if backoff > remaining {
+			backoff = remaining
+		}
+		time.Sleep(backoff)
+
+		if backoff *= 2; backoff > pingBackoffMax {
+			backoff = pingBackoffMax
+		}
+	}
+}
+
+// redactDSN strips the password from a DSN so it can be logged. It handles the
+// URL form ("postgres://user:pass@host/db"); anything else is withheld
+// entirely rather than risk echoing a credential.
+func redactDSN(dsn string) string {
+	if !strings.Contains(dsn, "://") {
+		return "<redacted dsn>"
+	}
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "<redacted dsn>"
+	}
+	return u.Redacted()
 }
 
 // Insert persists a new link. Returns an error wrapping a unique-constraint
